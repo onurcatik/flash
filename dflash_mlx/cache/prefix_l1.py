@@ -1,0 +1,444 @@
+# Copyright 2026 bstnxbt
+# Licensed under the Apache License, Version 2.0 - see LICENSE file
+# Based on DFlash (arXiv:2602.06036)
+
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any, Optional
+
+from dflash_mlx.observability.cache import record_cache_event
+from dflash_mlx.diagnostics import TraceConfig
+from dflash_mlx.cache.fingerprints import DFlashPrefixKey
+from dflash_mlx.cache.snapshot import DFlashPrefixSnapshot
+
+
+@dataclass(frozen=True)
+class PrefixCacheL1InsertResult:
+    admitted: bool
+    removed_snapshots: tuple[DFlashPrefixSnapshot, ...] = ()
+    inserted_evicted_snapshot: DFlashPrefixSnapshot | None = None
+    skipped_too_long: bool = False
+
+
+class DFlashPrefixCache:
+    def __init__(
+        self,
+        *,
+        max_entries: int = 4,
+        max_bytes: int = 8 * 1024 * 1024 * 1024,
+        cross_kind_prune: bool = True,
+        trace_config: Optional[TraceConfig] = None,
+        max_snapshot_tokens: int = 24000,
+        frontier_stride: int = 0,
+    ):
+        self._entries: dict[int, DFlashPrefixSnapshot] = {}
+        self._lru_order: list[int] = []
+        self._next_id = 0
+        self._max_entries = int(max_entries)
+        self._max_bytes = int(max_bytes)
+        self._lock = threading.Lock()
+        self._cross_kind_prune = bool(cross_kind_prune)
+        self._trace_config = trace_config
+        self._max_snapshot_tokens = max(0, int(max_snapshot_tokens))
+        self._frontier_stride = max(0, int(frontier_stride))
+        self._stats: dict[str, int] = {
+            "exact_hits": 0,
+            "prefix_hits": 0,
+            "misses": 0,
+            "insertions": 0,
+            "evictions": 0,
+            "byte_budget_evictions": 0,
+            "skipped_too_long": 0,
+            "prefix_prunes": 0,
+            "cross_kind_prunes": 0,
+            "prefill_tokens_saved": 0,
+            "fingerprint_rejects": 0,
+        }
+
+    @property
+    def frontier_stride(self) -> int:
+        return int(self._frontier_stride)
+
+    def lookup(
+        self,
+        req_tokens: list[int] | tuple[int, ...],
+        key: DFlashPrefixKey,
+        *,
+        record: bool = True,
+        request_id: int | None = None,
+    ) -> tuple[int, Optional[DFlashPrefixSnapshot]]:
+        req_tuple = tuple(int(t) for t in req_tokens)
+        t_start = time.perf_counter_ns()
+
+        with self._lock:
+            best_len = 0
+            best_id = -1
+            best_snapshot: Optional[DFlashPrefixSnapshot] = None
+            saw_fingerprint_reject = 0
+            longest_fingerprint_match_len = 0
+            longest_fingerprint_first_divergence = -1
+            for eid, snap in self._entries.items():
+                if snap.key != key:
+                    saw_fingerprint_reject += 1
+                    continue
+                snap_len = len(snap.token_ids)
+                if snap_len == 0 or snap_len > len(req_tuple):
+                    continue
+                if req_tuple[:snap_len] != snap.token_ids:
+                    common = 0
+                    upper = min(snap_len, len(req_tuple))
+                    for i in range(upper):
+                        if req_tuple[i] != snap.token_ids[i]:
+                            break
+                        common += 1
+                    if common > longest_fingerprint_match_len:
+                        longest_fingerprint_match_len = common
+                        longest_fingerprint_first_divergence = common
+                    continue
+                if snap_len > best_len:
+                    best_len = snap_len
+                    best_id = eid
+                    best_snapshot = snap
+
+            if best_snapshot is not None and best_len > 0:
+                exact = best_len == len(req_tuple)
+                if exact and (
+                    best_snapshot.kind != "prefill"
+                    or best_snapshot.last_logits is None
+                ):
+                    best_snapshot = None
+                else:
+
+                    if record:
+                        if best_id in self._lru_order:
+                            self._lru_order.remove(best_id)
+                        self._lru_order.append(best_id)
+                        if exact:
+                            self._stats["exact_hits"] += 1
+                        else:
+                            self._stats["prefix_hits"] += 1
+                        self._stats["prefill_tokens_saved"] += best_len
+                        entries_count_log = len(self._entries)
+                        self._log_cache(
+                            op="lookup",
+                            result="exact_hit" if exact else "prefix_hit",
+                            request_id=request_id,
+                            req_tokens=len(req_tuple),
+                            matched_len=int(best_len),
+                            entries=entries_count_log,
+                            elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
+                        )
+                    return (best_len, best_snapshot)
+
+            if not record:
+                return (0, None)
+
+            self._stats["misses"] += 1
+            miss_reason = "empty_cache"
+            if self._entries:
+                if saw_fingerprint_reject == len(self._entries):
+                    miss_reason = "fingerprint_reject_all"
+                    self._stats["fingerprint_rejects"] += 1
+                elif saw_fingerprint_reject > 0 and longest_fingerprint_match_len == 0:
+                    miss_reason = "fingerprint_reject_partial_no_token_match"
+                    self._stats["fingerprint_rejects"] += 1
+                elif longest_fingerprint_match_len == 0:
+                    miss_reason = "no_token_match"
+                else:
+                    miss_reason = "token_divergence"
+            entries_count = len(self._entries)
+            sfr = int(saw_fingerprint_reject)
+            longest_match = int(longest_fingerprint_match_len)
+            first_div = int(longest_fingerprint_first_divergence)
+
+        self._log_cache(
+            op="lookup",
+            result="miss",
+            request_id=request_id,
+            req_tokens=len(req_tuple),
+            matched_len=0,
+            entries=entries_count,
+            fingerprint_reject=sfr,
+            miss_reason=miss_reason,
+            longest_token_match_len=longest_match,
+            first_divergence_pos=first_div,
+            elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
+        )
+
+        return (0, None)
+
+    def insert(self, snapshot: DFlashPrefixSnapshot) -> bool:
+        return self.insert_with_evictions(snapshot).admitted
+
+    def insert_with_evictions(
+        self,
+        snapshot: DFlashPrefixSnapshot,
+        *,
+        skip_too_long: bool = True,
+    ) -> PrefixCacheL1InsertResult:
+        t_start = time.perf_counter_ns()
+        with self._lock:
+            pre_entries = len(self._entries)
+            pre_evictions = self._stats["evictions"]
+            pre_byte_evictions = self._stats["byte_budget_evictions"]
+            pre_prunes = self._stats["prefix_prunes"]
+            pre_cross_prunes = self._stats["cross_kind_prunes"]
+
+            max_tokens = self._max_snapshot_tokens
+            if skip_too_long and max_tokens > 0 and len(snapshot.token_ids) > max_tokens:
+                self._stats["skipped_too_long"] += 1
+                self._log_cache(
+                    op="insert_skipped",
+                    reason="too_long",
+                    prefix_len=int(len(snapshot.token_ids)),
+                    max_tokens=int(max_tokens),
+                    entries_before=pre_entries,
+                    entries_after=pre_entries,
+                    elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
+                )
+                return PrefixCacheL1InsertResult(
+                    admitted=False,
+                    skipped_too_long=True,
+                )
+
+            if self._incoming_generation_should_yield_to_prefill(snapshot):
+                self._stats["insertions"] += 1
+                self._stats["evictions"] += 1
+                self._stats["byte_budget_evictions"] += 1
+                breakdown = snapshot.nbytes_breakdown()
+                draft_context_bytes = int(
+                    breakdown.get("draft_context", breakdown.get("target_hidden", 0))
+                )
+                self._log_cache(
+                    op="insert",
+                    kind=snapshot.kind,
+                    prefix_len=int(snapshot.prefix_len),
+                    nbytes=int(snapshot.nbytes),
+                    bytes_fa_kv=int(breakdown.get("fa_kv", 0)),
+                    bytes_gdn_state=int(breakdown.get("gdn_state", 0)),
+                    bytes_draft_context=draft_context_bytes,
+                    bytes_target_hidden=draft_context_bytes,
+                    bytes_last_logits=int(breakdown.get("last_logits", 0)),
+                    entries_before=pre_entries,
+                    entries_after=pre_entries,
+                    pruned=0,
+                    cross_kind_pruned=0,
+                    evicted=1,
+                    byte_budget_evicted=1,
+                    current_bytes=int(self._current_bytes()),
+                    elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
+                )
+                return PrefixCacheL1InsertResult(
+                    admitted=False,
+                    removed_snapshots=(snapshot,),
+                    inserted_evicted_snapshot=snapshot,
+                )
+
+            removed_ids = self._prune_dominated_prefixes(snapshot)
+            eid = self._next_id
+            self._next_id += 1
+            self._entries[eid] = snapshot
+            self._lru_order.append(eid)
+            self._stats["insertions"] += 1
+            removed_ids.extend(self._evict_until_under_budget())
+            removed_snapshots = tuple(snapshot for _eid, snapshot in removed_ids)
+            inserted_evicted_snapshot = next(
+                (
+                    removed_snapshot
+                    for removed_eid, removed_snapshot in removed_ids
+                    if removed_eid == eid
+                ),
+                None,
+            )
+            breakdown = snapshot.nbytes_breakdown()
+            draft_context_bytes = int(
+                breakdown.get("draft_context", breakdown.get("target_hidden", 0))
+            )
+            self._log_cache(
+                op="insert",
+                kind=snapshot.kind,
+                prefix_len=int(snapshot.prefix_len),
+                nbytes=int(snapshot.nbytes),
+                bytes_fa_kv=int(breakdown.get("fa_kv", 0)),
+                bytes_gdn_state=int(breakdown.get("gdn_state", 0)),
+                bytes_draft_context=draft_context_bytes,
+                bytes_target_hidden=draft_context_bytes,
+                bytes_last_logits=int(breakdown.get("last_logits", 0)),
+                entries_before=pre_entries,
+                entries_after=len(self._entries),
+                pruned=int(self._stats["prefix_prunes"] - pre_prunes),
+                cross_kind_pruned=int(self._stats["cross_kind_prunes"] - pre_cross_prunes),
+                evicted=int(self._stats["evictions"] - pre_evictions),
+                byte_budget_evicted=int(self._stats["byte_budget_evictions"] - pre_byte_evictions),
+                current_bytes=int(self._current_bytes()),
+                elapsed_us=(time.perf_counter_ns() - t_start) / 1_000.0,
+            )
+            return PrefixCacheL1InsertResult(
+                admitted=eid in self._entries,
+                removed_snapshots=removed_snapshots,
+                inserted_evicted_snapshot=inserted_evicted_snapshot,
+            )
+
+    def set_trace_config(self, trace_config: Optional[TraceConfig]) -> None:
+        self._trace_config = trace_config
+
+    def _log_cache(self, **fields: Any) -> None:
+        record_cache_event(self._trace_config, **fields)
+
+    def _prune_dominated_prefixes(
+        self,
+        snapshot: DFlashPrefixSnapshot,
+    ) -> list[tuple[int, DFlashPrefixSnapshot]]:
+        incoming = snapshot.token_ids
+        doomed_same: list[int] = []
+        doomed_cross: list[int] = []
+        removed: list[tuple[int, DFlashPrefixSnapshot]] = []
+        for eid, existing in self._entries.items():
+            if existing.key != snapshot.key:
+                continue
+            same_kind = existing.kind == snapshot.kind
+            if not same_kind and not self._cross_kind_prune:
+                continue
+            if existing.kind == "prefill" and snapshot.kind == "generation":
+                # Generation snapshots are prefix-only; keep prefill for exact prompt reuse.
+                continue
+            n = len(existing.token_ids)
+            if n <= len(incoming) and incoming[:n] == existing.token_ids:
+                if same_kind:
+                    if n == len(incoming) or not self._preserve_aligned_frontier(
+                        existing_len=n,
+                        incoming_len=len(incoming),
+                        kind=existing.kind,
+                    ):
+                        doomed_same.append(eid)
+                else:
+                    doomed_cross.append(eid)
+        for eid in doomed_same:
+            if eid in self._entries:
+                removed.append((eid, self._entries.pop(eid)))
+                self._stats["prefix_prunes"] += 1
+            if eid in self._lru_order:
+                self._lru_order.remove(eid)
+        for eid in doomed_cross:
+            if eid in self._entries:
+                removed.append((eid, self._entries.pop(eid)))
+                self._stats["cross_kind_prunes"] += 1
+            if eid in self._lru_order:
+                self._lru_order.remove(eid)
+        return removed
+
+    def _preserve_aligned_frontier(
+        self,
+        *,
+        existing_len: int,
+        incoming_len: int,
+        kind: str,
+    ) -> bool:
+        stride = self._frontier_stride
+        return (
+            kind == "prefill"
+            and stride > 0
+            and existing_len > 0
+            and existing_len < incoming_len
+            and existing_len % stride == 0
+        )
+
+    def _evict_until_under_budget(self) -> list[tuple[int, DFlashPrefixSnapshot]]:
+        evicted: list[tuple[int, DFlashPrefixSnapshot]] = []
+        while self._lru_order and (
+            len(self._entries) > self._max_entries
+            or self._current_bytes() > self._max_bytes
+        ):
+            byte_pressure = self._current_bytes() > self._max_bytes
+            eid = self._lru_order.pop(0)
+            if eid in self._entries:
+                evicted_snapshot = self._entries.pop(eid)
+                self._stats["evictions"] += 1
+                if byte_pressure:
+                    self._stats["byte_budget_evictions"] += 1
+                evicted.append((eid, evicted_snapshot))
+        return evicted
+
+    def _incoming_generation_should_yield_to_prefill(
+        self,
+        snapshot: DFlashPrefixSnapshot,
+    ) -> bool:
+        if snapshot.kind != "generation":
+            return False
+        incoming = snapshot.token_ids
+        for existing in self._entries.values():
+            if existing is snapshot:
+                continue
+            if existing.key != snapshot.key or existing.kind != "prefill":
+                continue
+            n = len(existing.token_ids)
+            if (
+                n > 0
+                and n <= len(incoming)
+                and incoming[:n] == existing.token_ids
+                and existing.nbytes + snapshot.nbytes > self._max_bytes
+            ):
+                return True
+        return False
+
+    def _current_bytes(self) -> int:
+        return sum(s.nbytes for s in self._entries.values())
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            out: dict[str, Any] = dict(self._stats)
+            out["current_entries"] = len(self._entries)
+            out["current_bytes"] = self._current_bytes()
+            out["max_entries"] = self._max_entries
+            out["max_bytes"] = self._max_bytes
+        return out
+
+    def memory_waterfall_bytes(self) -> dict[str, int]:
+        out = {
+            "l1_snapshot_bytes": 0,
+            "l1_snapshot_fa_kv_bytes": 0,
+            "l1_snapshot_gdn_state_bytes": 0,
+            "l1_snapshot_draft_context_bytes": 0,
+            "l1_snapshot_target_hidden_bytes": 0,
+            "l1_snapshot_last_logits_bytes": 0,
+            "prefix_prunes": 0,
+            "cross_kind_prunes": 0,
+            "byte_budget_evictions": 0,
+        }
+        with self._lock:
+            stats = dict(self._stats)
+            entries = list(self._entries.values())
+            current_bytes = self._current_bytes()
+        out["l1_snapshot_bytes"] = int(current_bytes)
+        out["prefix_prunes"] = int(stats.get("prefix_prunes", 0))
+        out["cross_kind_prunes"] = int(stats.get("cross_kind_prunes", 0))
+        out["byte_budget_evictions"] = int(stats.get("byte_budget_evictions", 0))
+        if entries:
+            fa = gdn = draft_context = logits = total = 0
+            for snapshot in entries:
+                breakdown = snapshot.nbytes_breakdown()
+                fa += int(breakdown.get("fa_kv", 0) or 0)
+                gdn += int(breakdown.get("gdn_state", 0) or 0)
+                draft_context += int(
+                    breakdown.get("draft_context", breakdown.get("target_hidden", 0)) or 0
+                )
+                logits += int(breakdown.get("last_logits", 0) or 0)
+                total += int(snapshot.nbytes)
+            out["l1_snapshot_bytes"] = total
+            out["l1_snapshot_fa_kv_bytes"] = fa
+            out["l1_snapshot_gdn_state_bytes"] = gdn
+            out["l1_snapshot_draft_context_bytes"] = draft_context
+            out["l1_snapshot_target_hidden_bytes"] = draft_context
+            out["l1_snapshot_last_logits_bytes"] = logits
+        return out
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._lru_order.clear()
+
+    def shutdown(self) -> None:
+        return None
