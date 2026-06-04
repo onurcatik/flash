@@ -21,7 +21,7 @@ bench = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/bstnxbt/dflash-mlx"
+Homepage = "https://github.com/onurcatik/flash"
 
 [project.scripts]
 dflash = "dflash_mlx.cli:main"

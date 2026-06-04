@@ -297,6 +297,4 @@ If you use DFlash or `dflash-mlx` in your research or applications, please cite 
 
 ---
 
-## 📄 License
 
-This project is licensed under the Apache 2.0 License. See [LICENSE](LICENSE) for details.
