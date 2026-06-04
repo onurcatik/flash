@@ -74,40 +74,7 @@ To eliminate redundant prefill overhead in multi-turn dialogues and repeated ben
 ### 4. Target-Owned Attention Routing
 Adapters for architectures like Qwen and Gemma route validation blocks through the appropriate MLX or Grouped Query Attention (GQA) reshape paths internally. This keeps the public CLI interfaces simple and free of manual attention-kernel toggle flags.
 
----
 
-## 📊 Benchmark Results
-
-> **Environment**: Apple M5 Max, 64 GB Unified Memory, macOS 15+, MLX `0.31.1`.
-> **Protocol**: Stock `mlx_lm.stream_generate` baseline vs. DFlash speculative decoding. Sequential generation, 3 repeats, median reported, 60s cooldown.
-> **Prompt**: Step-by-step math reasoning prompt (functional equation).
-
-| Model | Generated Tokens | Baseline | DFlash (Speculative) | Speedup | Acceptance Rate |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Qwen3.5-4B** | 1024 | 53.80 tok/s | 182.87 /s | **3.40x** | 86.43% |
-| **Qwen3.5-4B** | 2048 | 53.90 tok/s | 188.70 /s | **3.49x** | 87.70% |
-| **Qwen3.5-4B** | 4096 | 53.49 tok/s | 195.84 /s | **3.66x** | 88.35% |
-| **Qwen3.5-4B** | 8192 | 53.28 tok/s | 160.51 /s | **3.02x** | 87.30% |
-| **Qwen3.5-9B** | 1024 | 30.95 tok/s | 135.34 /s | **4.37x** | 89.55% |
-| **Qwen3.5-9B** | 2048 | 30.70 tok/s | 113.00 /s | **3.65x** | 89.16% |
-| **Qwen3.5-9B** | 4096 | 30.56 tok/s | 94.59 /s | **3.06x** | 88.31% |
-| **Qwen3.5-9B** | 8192 | 29.43 tok/s | 66.94 /s | **2.22x** | 86.67% |
-| **Qwen3.5-27B-4bit** | 1024 | 33.55 tok/s | 79.02 /s | **2.37x** | 90.04% |
-| **Qwen3.5-27B-4bit** | 2048 | 33.10 tok/s | 70.21 /s | **2.12x** | 89.60% |
-| **Qwen3.5-27B-4bit** | 4096 | 31.47 tok/s | 55.68 /s | **1.77x** | 88.38% |
-| **Qwen3.5-27B-4bit** | 8192 | 33.88 tok/s | 45.29 /s | **1.34x** | 85.97% |
-| **Qwen3.5-35B-A3B-4bit** | 1024 | 143.03 tok/s | 248.85 /s | **1.76x** | 89.26% |
-| **Qwen3.5-35B-A3B-4bit** | 2048 | 141.43 tok/s | 255.01 /s | **1.81x** | 89.75% |
-| **Qwen3.5-35B-A3B-4bit** | 4096 | 141.49 tok/s | 216.47 /s | **1.53x** | 88.50% |
-| **Qwen3.5-35B-A3B-4bit** | 8192 | 138.59 tok/s | 170.39 /s | **1.22x** | 86.41% |
-| **Qwen3.6-35B-A3B-4bit** | 1024 | 138.26 tok/s | 300.33 /s | **2.20x** | 91.02% |
-| **Qwen3.6-35B-A3B-4bit** | 2048 | 139.03 tok/s | 252.93 /s | **1.82x** | 89.60% |
-| **Qwen3.6-35B-A3B-4bit** | 4096 | 134.50 tok/s | 208.40 /s | **1.56x** | 88.43% |
-| **Qwen3.6-35B-A3B-4bit** | 8192 | 133.20 tok/s | 177.45 /s | **1.33x** | 87.01% |
-
-*Detailed benchmark JSON logs are saved at [benchmark/results/](benchmark/results/). You can reproduce these measurements using the `dflash benchmark` command.*
-
----
 
 ## ⚙️ Installation
 
