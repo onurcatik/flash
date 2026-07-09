@@ -219,33 +219,8 @@ To introduce support for a new model family:
 2. Implement KV cache trimming and rollback policies.
 3. Validate logits output parity against reference implementations using pytest integration tests (e.g., `tests/test_sdpa_parity.py`).
 
----
 
-## 🗺️ Future Roadmap
 
-- [ ] **Additional Architecture Backends**: Scale target support to other architectures (such as Llama-3/Mistral models) with architecture-specific cache handling.
-- [ ] **Dynamic Tool-Call Auto-Fallback**: Automatically transition to target-only autoregressive generation when speculative acceptance rates drop below a threshold (e.g., for complex JSON/XML formatting).
-- [ ] **Sustained Long-Context Speculation**: Implement draft KV window scaling and optimized long-context verification pipelines to prevent acceptance collapse on context sizes $> 16K$.
-- [ ] **Metal Kernel Enhancements**: Optimize specialized hot paths for custom attention patterns and quantized linear layers.
 
----
-
-## 📝 Citation
-
-If you use DFlash or `dflash-mlx` in your research or applications, please cite the original DFlash publication:
-
-```bibtex
-@misc{chen2026dflash,
-  title={DFlash: Block Diffusion for Flash Speculative Decoding},
-  author={Jian Chen and Yesheng Liang and Zhijian Liu},
-  year={2026},
-  eprint={2602.06036},
-  archivePrefix={arXiv},
-  primaryClass={cs.CL},
-  url={https://arxiv.org/abs/2602.06036}
-}
-```
-
----
 
 
